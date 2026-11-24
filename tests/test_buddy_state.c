@@ -690,6 +690,24 @@ static void test_deepseek_page_flip_and_snapshot(void)
     assert(snapshot.deepseek.usage.requests_today == 6);
 }
 
+static void test_dsh_working_wakes_the_display(void)
+{
+    buddy_state_t state;
+    buddy_action_t action = {0};
+    buddy_event_t heartbeat = {.type = BUDDY_EVENT_HEARTBEAT};
+
+    buddy_state_init(&state, NULL);
+    state.screen_off = true;
+    state.screen_dimmed = true;
+    heartbeat.heartbeat.connected = true;
+    heartbeat.heartbeat.dsh.present = true;
+    heartbeat.heartbeat.dsh.available = true;
+    heartbeat.heartbeat.dsh.working = true;
+    buddy_state_reduce(&state, &heartbeat, 100, &action);
+    assert(state.dsh.working);
+    assert(!state.screen_off && !state.screen_dimmed);
+}
+
 static void test_auto_page_follows_work_and_rotates_when_both_work(void)
 {
     buddy_state_t state;
@@ -1462,6 +1480,7 @@ int main(void)
     test_original_screen_and_menu_navigation();
     test_deepseek_page_flip_and_snapshot();
     test_auto_page_follows_work_and_rotates_when_both_work();
+    test_dsh_working_wakes_the_display();
     test_dsh_completion_is_an_edge_and_never_a_pet_state();
     test_protocol_command_events_refresh_the_display();
     test_status_request_does_not_overwrite_message();

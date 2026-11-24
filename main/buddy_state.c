@@ -421,6 +421,7 @@ static void buddy_apply_heartbeat(buddy_state_t *state, const buddy_heartbeat_t 
                                   buddy_action_t *action)
 {
     bool was_live = state->connected && !state->heartbeat_stale;
+    bool dsh_was_working = state->dsh.present && state->dsh.available && state->dsh.working;
     /* A live heartbeat confirms that the authenticated host bridge is ready. */
     if (!state->connection_cue_sent && heartbeat->connected && heartbeat->codex_usage.present) {
         state->connection_cue_sent = true;
@@ -487,6 +488,12 @@ static void buddy_apply_heartbeat(buddy_state_t *state, const buddy_heartbeat_t 
         if (action != NULL) action->play_dsh_completion_sound = true;
     } else if (state->dsh.completion_sequence < state->dsh_completion_seen) {
         state->dsh_completion_seen = state->dsh.completion_sequence;
+    }
+    if (state->dsh.present && state->dsh.available && state->dsh.working && !dsh_was_working) {
+        state->screen_off = false;
+        state->screen_dimmed = false;
+        state->last_activity_ms = now_ms;
+        buddy_set_ui_refresh(action);
     }
     buddy_copy(state->message, sizeof(state->message), heartbeat->message);
     buddy_copy_entries(state->entries, heartbeat->entries);
@@ -848,7 +855,8 @@ void buddy_state_reduce(buddy_state_t *state, const buddy_event_t *event,
     bool attention = buddy_has_actionable_prompt(state) || state->passkey_visible || state->lan_pair_id ||
                      state->confirmation != BUDDY_CONFIRM_NONE || state->dsh_notice;
     bool working = state->connected && !state->heartbeat_stale &&
-                   (state->running > 0U || state->waiting > 0U);
+                   (state->running > 0U || state->waiting > 0U ||
+                    (state->dsh.available && state->dsh.working));
     static const uint64_t delays[BUDDY_SLEEP_COUNT] = {
         [BUDDY_SLEEP_1_MIN] = 60000ULL,
         [BUDDY_SLEEP_5_MIN] = 300000ULL,
