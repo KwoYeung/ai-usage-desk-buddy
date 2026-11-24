@@ -1,0 +1,4 @@
+- insert:
+    - id: passport-dsh-activity
+      name: '@local/passport-dsh-activity'
+      config: {}

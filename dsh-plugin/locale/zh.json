@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Passport DSH 状态",
+    "description": "把 DSH 的工作中和任务完成状态写入本机文件，供 AI Passport 桌面伙伴显示。",
+    "detail": "docs/DETAIL.md"
+  }
+}

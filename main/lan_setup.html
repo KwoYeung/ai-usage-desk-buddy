@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Passport · Wi-Fi 配网</title>
+<style>
+:root{color-scheme:dark;--ink:#e6f0f5;--dim:#a0b5bb;--accent:#9fd5ff;--line:#2a373b;--panel:#10191c;--surface:#152126}
+*{box-sizing:border-box}
+body{margin:0;background:#070a0c;color:var(--ink);font:16px/1.55 -apple-system,"PingFang SC",system-ui,sans-serif}
+main{max-width:520px;margin:auto;padding:24px 18px 32px}
+.brand{display:flex;align-items:center;gap:12px;color:var(--accent);font-size:20px;font-weight:700;line-height:1.2}
+.brand small{color:var(--dim);font-size:11px;letter-spacing:.08em}
+.mark{display:grid;place-items:center;background:var(--surface);border:1px solid var(--line);border-radius:10px;width:42px;height:42px}
+h1{font-size:30px;margin:24px 0 8px}
+p{color:var(--dim);margin:8px 0 18px}
+.tag{color:var(--accent);font-weight:650;border-top:1px solid var(--line);padding-top:14px;margin:16px 0 12px}
+form,#finish{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+#finish{margin-top:12px}
+#finish .tag{border:0;padding:0;margin:0 0 10px}
+label{display:block;margin:12px 0 5px;font-size:14px}
+input,select,button{font:inherit;width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:#0b1215;color:var(--ink)}
+input:focus,select:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button{color:var(--accent);cursor:pointer;font-weight:650}
+button.primary{background:var(--accent);color:#0b1922;border-color:var(--accent);margin-top:12px}
+button:disabled{opacity:.5}
+.row,.show{display:flex;gap:8px;align-items:center}
+.row select{min-width:0}
+.row button{width:auto;white-space:nowrap}
+.show input{width:18px;height:18px;accent-color:var(--accent)}
+.note,footer{color:var(--dim);font-size:12px}
+#status{margin:14px 0;padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow-wrap:anywhere}
+footer{margin-top:20px}
+[hidden]{display:none!important}
+</style>
+<main><div class="brand"><span class="mark" aria-hidden="true">P</span><span>Passport<br><small>CODEX · 网络配置</small></span></div>
+<h1>Wi-Fi 配网</h1><p>选择设备要连接的 2.4 GHz Wi-Fi。电脑接同一路由器的网线或 Wi-Fi，即可同步任务状态。</p>
+<div class="tag">01　选择网络</div>
+<form id="form"><label for="networks">附近的 Wi-Fi</label><div class="row"><select id="networks"><option value="">扫描后选择，也可手动填写</option></select><button type="button" id="scan">扫描</button></div>
+<label for="ssid">网络名称</label><input id="ssid" name="ssid" required autocomplete="off" placeholder="输入 Wi-Fi 名称">
+<label for="password">Wi-Fi 密码</label><input id="password" name="password" type="password" autocomplete="off" maxlength="63" placeholder="开放网络可留空">
+<label class="show"><input id="show" type="checkbox">显示密码</label><button id="save" class="primary" type="submit">保存网络</button></form>
+<div id="status" role="status" aria-live="polite">正在连接设备…</div>
+<section id="finish" hidden><div class="tag">02　连接并配对</div><p>网络已保存。点击下方连接 Wi-Fi，然后打开电脑端 Passport，搜索设备并核对校验码即可配对。</p>
+<button id="restart" class="primary">连接 Wi-Fi</button><p class="note">重启后热点会关闭。设备的 Wi-Fi 页面将显示局域网 IP；若一直显示「连接中」，请重新进入配网检查密码。</p></section>
+<footer>本地配网 · 无需云服务<br>热点将在 10 分钟后关闭；未保存时不会更改网络。</footer></main>
+<script>
+const $=id=>document.getElementById(id);let token='',saved=false;
+async function api(path,body){const response=await fetch(path,{method:body===undefined?'GET':'POST',headers:{'X-Passport-Token':token,...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(20000)});if(!response.ok)throw Error(await response.text());return response.json()}
+function report(message){$('status').textContent=message}
+async function scan(){ $('scan').disabled=true;report('正在扫描 2.4 GHz 网络…');try{const list=await api('/scan');$('networks').replaceChildren(new Option('请选择，或手动填写',''));const seen=new Set();for(const n of list){if(!n.ssid||seen.has(n.ssid))continue;seen.add(n.ssid);$('networks').add(new Option(n.ssid+(n.open?' · 开放':''),n.ssid))}report(list.length?'扫描完成，请选择网络。':'未发现网络，可以手动填写。')}catch(e){report('扫描失败，可以重试或手动填写网络名称。')}finally{$('scan').disabled=false}}
+$('scan').onclick=scan;$('networks').onchange=()=>{$('ssid').value=$('networks').value};$('show').onchange=()=>{$('password').type=$('show').checked?'text':'password'};
+$('form').onsubmit=async e=>{e.preventDefault();const ssid=$('ssid').value,password=$('password').value;const bytes=s=>new TextEncoder().encode(s).length;if(bytes(ssid)<1||bytes(ssid)>32||bytes(password)>63||(password&&bytes(password)<8)){report('网络名称最多 32 字节；密码为 8–63 字节，开放网络请留空。');return}$('save').disabled=true;try{await api('/save',{ssid,password});saved=true;$('password').value='';$('finish').hidden=false;report('已保存，可以直接连接 Wi-Fi，再到电脑端搜索设备。');$('finish').scrollIntoView({behavior:'smooth',block:'start'})}catch(e){report('未能确认保存，请检查热点连接后重试。')}finally{$('save').disabled=false}};
+$('restart').onclick=async()=>{if(!saved)return;$('restart').disabled=true;try{await api('/restart',{});report('设备正在连接 Wi-Fi。连接成功后，请在电脑端搜索 Passport 并配对。');$('form').hidden=true;$('finish').hidden=true}catch(e){report('连接已断开，请查看设备是否正在重启。若未重启，可按设备确认键退出配网。')}};
+(async()=>{try{const session=await(await fetch('/session',{signal:AbortSignal.timeout(8000)})).json();token=session.token;await scan()}catch(e){report('无法连接设备，请连接 Passport Setup 热点后刷新。')}})();
+</script></html>

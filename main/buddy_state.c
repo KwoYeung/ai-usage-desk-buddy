@@ -1,0 +1,945 @@
+#include "buddy_state.h"
+
+#include <stddef.h>
+#include <string.h>
+
+#define BUDDY_HEART_ANIMATION_MS 5000
+#define BUDDY_CELEBRATION_ANIMATION_MS 6000
+#define BUDDY_HEARTBEAT_TIMEOUT_MS 30000
+#define BUDDY_TOKEN_CELEBRATION_STEP 50000
+#define BUDDY_AUTO_PAGE_ROTATE_MS 5000ULL
+#define BUDDY_AUTO_PAGE_HOLD_MS 15000ULL
+
+static void buddy_copy(char *destination, size_t destination_size, const char *source)
+{
+    size_t length = 0;
+
+    if (destination_size == 0) {
+        return;
+    }
+    if (source != NULL) {
+        while (length + 1 < destination_size && source[length] != '\0') {
+            ++length;
+        }
+        memcpy(destination, source, length);
+    }
+    destination[length] = '\0';
+}
+
+static void buddy_copy_entries(char destination[BUDDY_ENTRY_COUNT][BUDDY_ENTRY_MAX],
+                               const char source[BUDDY_ENTRY_COUNT][BUDDY_ENTRY_MAX])
+{
+    unsigned index;
+
+    for (index = 0; index < BUDDY_ENTRY_COUNT; ++index) {
+        buddy_copy(destination[index], BUDDY_ENTRY_MAX, source[index]);
+    }
+}
+
+static bool buddy_string_matches_length(const char *value, size_t value_size, size_t length)
+{
+    size_t index;
+
+    if (length == 0 || length >= value_size) {
+        return false;
+    }
+    for (index = 0; index < value_size; ++index) {
+        if (value[index] == '\0') {
+            return index == length;
+        }
+    }
+    return false;
+}
+
+static bool buddy_prompt_id_is_valid(const buddy_prompt_t *prompt)
+{
+    return !prompt->id_truncated &&
+           buddy_string_matches_length(prompt->id, sizeof(prompt->id), prompt->id_length);
+}
+
+static void buddy_invalidate_prompt(buddy_state_t *state)
+{
+    memset(&state->prompt, 0, sizeof(state->prompt));
+    state->prompt_connection_generation = 0;
+    state->approval_locked = false;
+}
+
+static void buddy_clear_logical_session(buddy_state_t *state)
+{
+    state->connected = false;
+    state->connection = BUDDY_CONNECTION_OFFLINE;
+    state->total = 0;
+    state->running = 0;
+    state->waiting = 0;
+    state->tokens = 0;
+    state->tokens_today = 0;
+    state->message[0] = '\0';
+    memset(state->entries, 0, sizeof(state->entries));
+    state->heartbeat.total = 0;
+    state->heartbeat.running = 0;
+    state->heartbeat.waiting = 0;
+    state->heartbeat.tokens = 0;
+    state->heartbeat.tokens_today = 0;
+    state->heartbeat.message[0] = '\0';
+    memset(state->heartbeat.entries, 0, sizeof(state->heartbeat.entries));
+    buddy_invalidate_prompt(state);
+}
+
+static buddy_character_t buddy_character_for(const buddy_state_t *state, uint64_t now_ms)
+{
+    bool has_prompt = state->prompt.id[0] != '\0' && !state->heartbeat_stale &&
+                      !state->approval_locked;
+
+    if (state->confirmation_pending || state->connection == BUDDY_CONNECTION_CONFIRMING) {
+        return BUDDY_CHARACTER_CONFIRMATION;
+    }
+    if (state->connection == BUDDY_CONNECTION_PAIRING) {
+        return BUDDY_CHARACTER_PAIRING;
+    }
+    if (has_prompt) {
+        return BUDDY_CHARACTER_ATTENTION;
+    }
+    if (state->temporary_until_ms > now_ms) {
+        return state->temporary_character;
+    }
+    if (state->running > 0) {
+        return BUDDY_CHARACTER_BUSY;
+    }
+    if (state->connected && !state->heartbeat_stale) {
+        return BUDDY_CHARACTER_IDLE;
+    }
+    return BUDDY_CHARACTER_SLEEP;
+}
+
+static void buddy_refresh_character(buddy_state_t *state, uint64_t now_ms)
+{
+    state->character = buddy_character_for(state, now_ms);
+}
+
+static void buddy_clear_stale_prompt(buddy_state_t *state, uint64_t now_ms)
+{
+    if (!state->heartbeat_stale && now_ms - state->last_heartbeat_ms >= BUDDY_HEARTBEAT_TIMEOUT_MS) {
+        state->heartbeat_stale = true;
+        buddy_clear_logical_session(state);
+    }
+}
+
+static void buddy_set_ui_refresh(buddy_action_t *action)
+{
+    if (action != NULL) {
+        action->type = BUDDY_ACTION_UI_REFRESH;
+    }
+}
+
+static bool buddy_has_actionable_prompt(const buddy_state_t *state)
+{
+    return state->prompt.id[0] != '\0' && !state->heartbeat_stale &&
+           !state->approval_locked && buddy_prompt_id_is_valid(&state->prompt);
+}
+
+static bool buddy_has_prompt(const buddy_state_t *state)
+{
+    return state->prompt.id[0] != '\0';
+}
+
+static void buddy_open_confirmation(buddy_state_t *state, buddy_confirmation_t confirmation,
+                                    bool acknowledge, uint32_t connection_generation,
+                                    buddy_action_t *action)
+{
+    buddy_invalidate_prompt(state);
+    state->confirmation = confirmation;
+    state->confirmation_pending = confirmation != BUDDY_CONFIRM_NONE;
+    state->confirmation_acknowledge = acknowledge;
+    state->confirmation_connection_generation = connection_generation;
+    state->connection = BUDDY_CONNECTION_CONFIRMING;
+    buddy_set_ui_refresh(action);
+}
+
+static void buddy_close_confirmation(buddy_state_t *state)
+{
+    state->confirmation = BUDDY_CONFIRM_NONE;
+    state->confirmation_pending = false;
+    state->confirmation_acknowledge = false;
+    state->confirmation_connection_generation = 0;
+    state->connection = state->connected ? BUDDY_CONNECTION_CONNECTED
+                                         : BUDDY_CONNECTION_OFFLINE;
+}
+
+static void buddy_settings_click(buddy_state_t *state, buddy_key_t key,
+                                 buddy_action_t *action)
+{
+    if (state->reset_open) {
+        if (key == BUDDY_KEY_UP) {
+            state->reset_selection = (buddy_reset_item_t)(
+                (state->reset_selection + BUDDY_RESET_COUNT - 1) % BUDDY_RESET_COUNT);
+            buddy_set_ui_refresh(action);
+        } else if (key == BUDDY_KEY_DOWN) {
+            state->reset_selection =
+                (buddy_reset_item_t)((state->reset_selection + 1) % BUDDY_RESET_COUNT);
+            buddy_set_ui_refresh(action);
+        } else if (key == BUDDY_KEY_OK) {
+            if (state->reset_selection == BUDDY_RESET_FACTORY_RESET) {
+                buddy_open_confirmation(state, BUDDY_CONFIRM_FACTORY_RESET, false, 0, action);
+            } else if (state->reset_selection == BUDDY_RESET_UNPAIR) {
+                buddy_open_confirmation(state, BUDDY_CONFIRM_UNPAIR, false, 0, action);
+            } else if (state->reset_selection == BUDDY_RESET_BACK) {
+                state->reset_open = false;
+                buddy_set_ui_refresh(action);
+            }
+        }
+        return;
+    }
+    if (key == BUDDY_KEY_UP) {
+        state->settings_selection =
+            (buddy_settings_item_t)((state->settings_selection + BUDDY_SETTINGS_COUNT - 1) %
+                                    BUDDY_SETTINGS_COUNT);
+        buddy_set_ui_refresh(action);
+        return;
+    }
+    if (key == BUDDY_KEY_DOWN) {
+        state->settings_selection =
+            (buddy_settings_item_t)((state->settings_selection + 1) % BUDDY_SETTINGS_COUNT);
+        buddy_set_ui_refresh(action);
+        return;
+    }
+    if (key != BUDDY_KEY_OK) {
+        return;
+    }
+
+    switch (state->settings_selection) {
+    case BUDDY_SETTINGS_BRIGHTNESS:
+        state->brightness_level = (uint8_t)((state->brightness_level + 1U) % 5U);
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_DISPLAY_BACKLIGHT;
+            action->brightness_percent = buddy_brightness_percent(state->brightness_level);
+        }
+        break;
+    case BUDDY_SETTINGS_SLEEP:
+        state->settings.sleep_mode = (uint8_t)((state->settings.sleep_mode + 1U) % BUDDY_SLEEP_COUNT);
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_SETTINGS;
+            action->settings = state->settings;
+        }
+        break;
+    case BUDDY_SETTINGS_SOUND:
+        state->settings.sound_mode = (uint8_t)((state->settings.sound_mode + 1U) % BUDDY_SOUND_COUNT);
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_SETTINGS;
+            action->settings = state->settings;
+        }
+        break;
+    case BUDDY_SETTINGS_VOLUME:
+        state->settings.volume_level = (uint8_t)(state->settings.volume_level % BUDDY_VOLUME_LEVEL_COUNT + 1U);
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_SETTINGS;
+            action->settings = state->settings;
+        }
+        break;
+    case BUDDY_SETTINGS_TONE:
+        state->settings.tone = (uint8_t)((state->settings.tone + 1U) % BUDDY_TONE_COUNT);
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_SETTINGS;
+            action->settings = state->settings;
+            action->play_test_sound = state->settings.sound_mode != BUDDY_SOUND_OFF;
+        }
+        break;
+    case BUDDY_SETTINGS_WIFI:
+        state->page = BUDDY_PAGE_WIFI;
+        state->info_page = BUDDY_WIFI_BACK;
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_SETTINGS_BLE:
+        state->settings.ble_enabled = !state->settings.ble_enabled;
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_BLE_TOGGLE;
+            action->ble_enabled = state->settings.ble_enabled;
+        }
+        break;
+    case BUDDY_SETTINGS_RESET:
+        state->reset_open = true;
+        state->reset_selection = BUDDY_RESET_BACK;
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_SETTINGS_BACK:
+    case BUDDY_SETTINGS_COUNT:
+        state->page = BUDDY_PAGE_HOME;
+        state->menu_open = true;
+        buddy_set_ui_refresh(action);
+        break;
+    }
+}
+
+static void buddy_normal_click(buddy_state_t *state, buddy_key_t key,
+                               buddy_action_t *action)
+{
+    if (state->menu_open) {
+        if (key == BUDDY_KEY_UP) {
+            state->menu_selection = (buddy_menu_item_t)(
+                (state->menu_selection + BUDDY_MENU_COUNT - 1) % BUDDY_MENU_COUNT);
+        } else if (key == BUDDY_KEY_DOWN) {
+            state->menu_selection =
+                (buddy_menu_item_t)((state->menu_selection + 1) % BUDDY_MENU_COUNT);
+        } else if (key == BUDDY_KEY_OK) {
+            if (state->menu_selection == BUDDY_MENU_SETTINGS) {
+                state->page = BUDDY_PAGE_SETTINGS;
+                state->settings_selection = BUDDY_SETTINGS_BACK;
+            } else if (state->menu_selection == BUDDY_MENU_TURN_OFF) {
+                state->screen_off = true;
+                if (action != NULL) {
+                    action->type = BUDDY_ACTION_SCREEN_OFF;
+                }
+            } else if (state->menu_selection == BUDDY_MENU_HELP) {
+                state->page = BUDDY_PAGE_INFO;
+                state->info_page = 1;
+            }
+            state->menu_open = false;
+        }
+        buddy_set_ui_refresh(action);
+        return;
+    }
+    if (state->page == BUDDY_PAGE_DEEPSEEK) {
+        if ((key == BUDDY_KEY_UP || key == BUDDY_KEY_OK) &&
+            !state->passkey_visible && state->lan_pair_id == 0) {
+            state->page = BUDDY_PAGE_HOME;
+            buddy_set_ui_refresh(action);
+        }
+        return;
+    }
+    if (state->page == BUDDY_PAGE_HOME && key == BUDDY_KEY_UP &&
+        !state->passkey_visible && state->lan_pair_id == 0) {
+        state->page = BUDDY_PAGE_DEEPSEEK;
+        buddy_set_ui_refresh(action);
+        return;
+    }
+    if (state->page == BUDDY_PAGE_WIFI) {
+        if (key == BUDDY_KEY_UP || key == BUDDY_KEY_DOWN) {
+            unsigned step = key == BUDDY_KEY_UP ? BUDDY_WIFI_COUNT - 1 : 1;
+            state->info_page = (uint8_t)((state->info_page + step) % BUDDY_WIFI_COUNT);
+            buddy_set_ui_refresh(action);
+        } else if (key == BUDDY_KEY_OK) {
+            if (state->info_page == BUDDY_WIFI_BACK) {
+                state->page = BUDDY_PAGE_SETTINGS;
+                buddy_set_ui_refresh(action);
+            } else if (action != NULL && state->info_page == BUDDY_WIFI_SETUP) {
+                action->type = BUDDY_ACTION_LAN_SETUP;
+            } else if (action != NULL && state->info_page == BUDDY_WIFI_ENABLE && !state->lan_mode) {
+                action->type = BUDDY_ACTION_LAN_ENABLE;
+            }
+        }
+    } else if (state->page == BUDDY_PAGE_INFO && state->lan_setup) {
+        if (key == BUDDY_KEY_OK && action != NULL) action->type = BUDDY_ACTION_LAN_SETUP;
+    } else if (state->page == BUDDY_PAGE_INFO && key == BUDDY_KEY_OK) {
+        state->page = BUDDY_PAGE_HOME;
+        state->menu_open = true;
+        buddy_set_ui_refresh(action);
+    } else if (state->page == BUDDY_PAGE_SETTINGS) {
+        buddy_settings_click(state, key, action);
+    } else if (key == BUDDY_KEY_OK && state->page == BUDDY_PAGE_HOME && !state->passkey_visible) {
+        state->menu_open = true;
+        state->menu_selection = BUDDY_MENU_CLOSE;
+        state->reset_open = false;
+        buddy_set_ui_refresh(action);
+    } else if (key == BUDDY_KEY_DOWN && state->page == BUDDY_PAGE_HOME &&
+               state->passkey_visible && action != NULL) {
+        action->type = BUDDY_ACTION_UI_SCROLL;
+        action->scroll_delta = -24;
+    }
+}
+
+static bool buddy_prompt_ids_match(const buddy_prompt_t *left, const buddy_prompt_t *right)
+{
+    return left->id_length == right->id_length &&
+           left->id_length > 0 &&
+           memcmp(left->id, right->id, left->id_length) == 0;
+}
+
+static bool buddy_prompt_was_attempted(const buddy_state_t *state,
+                                       const buddy_prompt_t *prompt)
+{
+    return buddy_string_matches_length(state->last_attempted_prompt_id,
+                                       sizeof(state->last_attempted_prompt_id),
+                                       prompt->id_length) &&
+           memcmp(state->last_attempted_prompt_id, prompt->id, prompt->id_length) == 0;
+}
+
+static void buddy_update_auto_page(buddy_state_t *state, uint64_t now_ms,
+                                    buddy_action_t *action)
+{
+    if (state->page != BUDDY_PAGE_HOME && state->page != BUDDY_PAGE_DEEPSEEK) {
+        return;
+    }
+    if (state->menu_open || state->passkey_visible || state->lan_pair_id != 0 ||
+        state->confirmation != BUDDY_CONFIRM_NONE ||
+        buddy_has_actionable_prompt(state)) {
+        return;
+    }
+
+    bool live = state->connected && !state->heartbeat_stale;
+    uint8_t mask = 0;
+    if (live && state->running > 0U) mask |= 1U;
+    if (live && state->dsh.available && state->dsh.working) mask |= 2U;
+    state->auto_page_mask = mask;
+
+    if (now_ms < state->auto_page_hold_until_ms) {
+        return;
+    }
+
+    buddy_page_t target = state->page;
+    bool switch_page = false;
+    if (mask == 1U) {
+        state->auto_page_rotation = false;
+        if (state->page != BUDDY_PAGE_HOME) {
+            target = BUDDY_PAGE_HOME;
+            switch_page = true;
+        }
+    } else if (mask == 2U) {
+        state->auto_page_rotation = false;
+        if (state->page != BUDDY_PAGE_DEEPSEEK) {
+            target = BUDDY_PAGE_DEEPSEEK;
+            switch_page = true;
+        }
+    } else if (mask == 3U) {
+        if (!state->auto_page_rotation) {
+            state->auto_page_rotation = true;
+            state->auto_page_last_switch_ms = now_ms;
+        } else if (now_ms - state->auto_page_last_switch_ms >= BUDDY_AUTO_PAGE_ROTATE_MS) {
+            target = state->page == BUDDY_PAGE_HOME ? BUDDY_PAGE_DEEPSEEK : BUDDY_PAGE_HOME;
+            switch_page = true;
+            state->auto_page_last_switch_ms = now_ms;
+        }
+    } else {
+        state->auto_page_rotation = false;
+    }
+    if (switch_page) {
+        state->page = target;
+        buddy_set_ui_refresh(action);
+    }
+}
+
+static void buddy_apply_heartbeat(buddy_state_t *state, const buddy_heartbeat_t *heartbeat,
+                                  uint32_t connection_generation, uint64_t now_ms,
+                                  buddy_action_t *action)
+{
+    bool was_live = state->connected && !state->heartbeat_stale;
+    /* A live heartbeat confirms that the authenticated host bridge is ready. */
+    if (!state->connection_cue_sent && heartbeat->connected && heartbeat->codex_usage.present) {
+        state->connection_cue_sent = true;
+        if (action != NULL) action->play_connection_sound = true;
+    }
+    uint64_t level = heartbeat->codex_usage.present
+                         ? heartbeat->codex_usage.completion_sequence
+                         : heartbeat->tokens / BUDDY_TOKEN_CELEBRATION_STEP;
+
+    if (heartbeat->connected && (((heartbeat->running > 0U || heartbeat->waiting > 0U) &&
+            (!was_live || (state->running == 0U && state->waiting == 0U))) ||
+            (was_live && level > state->highest_celebrated_level))) {
+        state->screen_off = false;
+        state->last_activity_ms = now_ms;
+    }
+    if (was_live && (state->running > 0U || state->waiting > 0U) &&
+            heartbeat->running == 0U && heartbeat->waiting == 0U) {
+        state->last_activity_ms = now_ms;
+    }
+    state->heartbeat = *heartbeat;
+    state->connected = heartbeat->connected;
+    state->connection = heartbeat->connected ? BUDDY_CONNECTION_CONNECTED : BUDDY_CONNECTION_OFFLINE;
+    state->heartbeat_stale = !heartbeat->connected;
+    if (!heartbeat->connected) {
+        buddy_invalidate_prompt(state);
+    } else if (heartbeat->prompt.id[0] == '\0') {
+        buddy_invalidate_prompt(state);
+    } else if (!buddy_prompt_id_is_valid(&heartbeat->prompt)) {
+        buddy_invalidate_prompt(state);
+    } else if (state->prompt.id[0] != '\0' &&
+               buddy_prompt_ids_match(&state->prompt, &heartbeat->prompt)) {
+        state->prompt = heartbeat->prompt;
+        state->prompt_connection_generation = connection_generation;
+    } else if (buddy_prompt_was_attempted(state, &heartbeat->prompt)) {
+        buddy_invalidate_prompt(state);
+    } else {
+        state->prompt = heartbeat->prompt;
+        state->prompt_connection_generation = connection_generation;
+        state->approval_locked = false;
+        state->permission_delivery = BUDDY_PERMISSION_DELIVERY_NONE;
+    }
+    state->last_heartbeat_ms = now_ms;
+    state->running = heartbeat->running;
+    state->total = heartbeat->total;
+    state->waiting = heartbeat->waiting;
+    state->tokens = heartbeat->tokens;
+    state->tokens_today = heartbeat->tokens_today;
+    state->codex_usage = heartbeat->codex_usage;
+    state->deepseek = heartbeat->deepseek;
+    state->dsh = heartbeat->dsh;
+    if (!state->dsh.present || !state->dsh.available) {
+        state->dsh.working = false;
+        state->dsh_baseline = false;
+    } else if (!was_live || !state->dsh_baseline) {
+        state->dsh_completion_seen = state->dsh.completion_sequence;
+        state->dsh_baseline = true;
+    } else if (state->dsh.completion_sequence > state->dsh_completion_seen) {
+        state->dsh_completion_seen = state->dsh.completion_sequence;
+        state->dsh_notice = true;
+        state->dsh_notice_until_ms = now_ms + 6000U;
+        state->screen_off = false;
+        state->screen_dimmed = false;
+        state->last_activity_ms = now_ms;
+        if (action != NULL) action->play_dsh_completion_sound = true;
+    } else if (state->dsh.completion_sequence < state->dsh_completion_seen) {
+        state->dsh_completion_seen = state->dsh.completion_sequence;
+    }
+    buddy_copy(state->message, sizeof(state->message), heartbeat->message);
+    buddy_copy_entries(state->entries, heartbeat->entries);
+
+    /* Codex counters belong to the connected computer. A new session (or a
+     * reset local counter) establishes a baseline without replaying old alerts. */
+    if (heartbeat->codex_usage.present &&
+            (!was_live || level < state->highest_celebrated_level)) {
+        state->highest_celebrated_level = level;
+        state->settings.highest_celebrated_level = level;
+        state->temporary_character = BUDDY_CHARACTER_IDLE;
+        state->temporary_until_ms = 0;
+        buddy_set_ui_refresh(action);
+        return;
+    }
+
+    if (level > state->highest_celebrated_level) {
+        state->highest_celebrated_level = level;
+        state->settings.highest_celebrated_level = level;
+        state->temporary_character = BUDDY_CHARACTER_CELEBRATE;
+        state->temporary_until_ms = now_ms + BUDDY_CELEBRATION_ANIMATION_MS;
+        if (action != NULL) {
+            action->play_completion_sound = was_live && heartbeat->connected && heartbeat->codex_usage.present;
+            action->type = BUDDY_ACTION_SETTINGS;
+            action->settings = state->settings;
+        }
+        return;
+    }
+    buddy_set_ui_refresh(action);
+}
+
+static void buddy_apply_prompt(buddy_state_t *state, const buddy_prompt_t *prompt,
+                               uint32_t connection_generation, uint64_t now_ms,
+                               buddy_action_t *action)
+{
+    if (!prompt->connected || !buddy_prompt_id_is_valid(prompt) ||
+        buddy_prompt_was_attempted(state, prompt)) {
+        return;
+    }
+
+    state->prompt = *prompt;
+    state->prompt_connection_generation = connection_generation;
+    state->approval_locked = false;
+    state->permission_delivery = BUDDY_PERMISSION_DELIVERY_NONE;
+    state->connected = true;
+    state->connection = BUDDY_CONNECTION_CONNECTED;
+    state->heartbeat_stale = false;
+    state->last_heartbeat_ms = now_ms;
+    state->running = prompt->running;
+    buddy_set_ui_refresh(action);
+}
+
+static bool buddy_observed_prompt_matches(const buddy_event_t *event, const buddy_prompt_t *prompt)
+{
+    if (!event->has_observed_prompt_id) {
+        return true;
+    }
+    if (event->observed_prompt_id_truncated ||
+        !buddy_string_matches_length(event->observed_prompt_id,
+                                     sizeof(event->observed_prompt_id),
+                                     event->observed_prompt_id_length)) {
+        return false;
+    }
+    return event->observed_prompt_id_length == prompt->id_length &&
+           memcmp(event->observed_prompt_id, prompt->id, prompt->id_length) == 0;
+}
+
+static void buddy_decide_prompt(buddy_state_t *state, const buddy_event_t *event,
+                                buddy_permission_decision_t decision,
+                                buddy_action_t *action)
+{
+    if (state->approval_locked || state->prompt.id[0] == '\0' || state->heartbeat_stale ||
+        !buddy_prompt_id_is_valid(&state->prompt) ||
+        !buddy_observed_prompt_matches(event, &state->prompt)) {
+        return;
+    }
+
+    if (action != NULL) {
+        action->type = BUDDY_ACTION_PERMISSION;
+        buddy_copy(action->permission.id, sizeof(action->permission.id), state->prompt.id);
+        buddy_copy(action->permission.tool, sizeof(action->permission.tool), state->prompt.tool);
+        buddy_copy(action->permission.hint, sizeof(action->permission.hint), state->prompt.hint);
+        action->permission.decision = decision;
+        action->permission.connection_generation = state->prompt_connection_generation;
+    }
+    buddy_copy(state->last_attempted_prompt_id, sizeof(state->last_attempted_prompt_id),
+               state->prompt.id);
+    state->approval_locked = true;
+    state->permission_delivery = BUDDY_PERMISSION_DELIVERY_SENDING;
+}
+
+static void buddy_apply_permission_result(buddy_state_t *state,
+                                          const buddy_permission_result_event_t *result,
+                                          uint64_t now_ms, buddy_action_t *action)
+{
+    if (state->permission_delivery != BUDDY_PERMISSION_DELIVERY_SENDING ||
+        !buddy_string_matches_length(result->id, sizeof(result->id), result->id_length) ||
+        !buddy_string_matches_length(state->last_attempted_prompt_id,
+                                     sizeof(state->last_attempted_prompt_id),
+                                     result->id_length) ||
+        memcmp(state->last_attempted_prompt_id, result->id, result->id_length) != 0) {
+        return;
+    }
+    if (result->success) {
+        buddy_copy(state->last_successful_decision_id,
+                   sizeof(state->last_successful_decision_id), result->id);
+        state->permission_delivery = BUDDY_PERMISSION_DELIVERY_SENT;
+        if (result->decision == BUDDY_PERMISSION_ONCE) {
+            state->temporary_character = BUDDY_CHARACTER_HEART;
+            state->temporary_until_ms = now_ms + BUDDY_HEART_ANIMATION_MS;
+        }
+    } else {
+        state->permission_delivery = BUDDY_PERMISSION_DELIVERY_FAILED;
+    }
+    buddy_set_ui_refresh(action);
+}
+
+void buddy_state_init(buddy_state_t *state, const buddy_settings_snapshot_t *settings)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    memset(state, 0, sizeof(*state));
+    state->connection = BUDDY_CONNECTION_OFFLINE;
+    state->page = BUDDY_PAGE_HOME;
+    state->heartbeat_stale = true;
+    state->brightness_level = BUDDY_DEFAULT_BRIGHTNESS_LEVEL;
+    state->settings.sleep_mode = BUDDY_DEFAULT_SLEEP_MODE;
+    if (settings != NULL) {
+        state->settings = *settings;
+        state->highest_celebrated_level = settings->highest_celebrated_level;
+        buddy_copy(state->name, sizeof(state->name), settings->name);
+        buddy_copy(state->owner, sizeof(state->owner), settings->owner);
+    }
+    buddy_refresh_character(state, 0);
+}
+
+void buddy_state_reduce(buddy_state_t *state, const buddy_event_t *event,
+                        uint64_t now_ms, buddy_action_t *action)
+{
+    if (action != NULL) {
+        memset(action, 0, sizeof(*action));
+    }
+    if (state == NULL || event == NULL) {
+        return;
+    }
+
+    buddy_clear_stale_prompt(state, now_ms);
+    if (event->type == BUDDY_EVENT_KEY_CLICK || event->type == BUDDY_EVENT_KEY_LONG) {
+        state->last_activity_ms = now_ms;
+        if (state->screen_off || state->screen_dimmed) {
+            state->screen_off = false;
+            state->screen_dimmed = false;
+            if (action != NULL) {
+                action->type = BUDDY_ACTION_DISPLAY_BACKLIGHT;
+                action->brightness_percent = buddy_brightness_percent(state->brightness_level);
+            }
+            return; /* Consume the wake gesture, including a long press. */
+        }
+    }
+
+    switch (event->type) {
+    case BUDDY_EVENT_HEARTBEAT:
+        buddy_apply_heartbeat(state, &event->heartbeat, event->ble.connection_generation,
+                              now_ms, action);
+        break;
+    case BUDDY_EVENT_PROMPT:
+        buddy_apply_prompt(state, &event->prompt, event->ble.connection_generation,
+                           now_ms, action);
+        break;
+    case BUDDY_EVENT_TIME:
+        state->epoch_seconds = event->time.epoch_seconds;
+        state->timezone_offset_seconds = event->time.timezone_offset_seconds;
+        state->time_received_ms = now_ms;
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_NAME:
+        buddy_copy(state->name, sizeof(state->name), event->command.value);
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_OWNER:
+        buddy_copy(state->owner, sizeof(state->owner), event->command.value);
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_STATUS:
+        buddy_copy(state->message, sizeof(state->message), event->command.value);
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_SOUND_TEST:
+        if (action != NULL && state->connected && !state->heartbeat_stale &&
+            state->settings.sound_mode != BUDDY_SOUND_OFF) {
+            action->play_test_sound = true;
+        }
+        break;
+    case BUDDY_EVENT_STATUS_REQUEST:
+        if (action != NULL) {
+            action->type = BUDDY_ACTION_STATUS;
+            action->connection_generation = event->ble.connection_generation;
+        }
+        break;
+    case BUDDY_EVENT_UNPAIR_CONFIRMATION:
+        if (state->confirmation == BUDDY_CONFIRM_NONE) {
+            buddy_open_confirmation(state, BUDDY_CONFIRM_UNPAIR, true,
+                                    event->ble.connection_generation, action);
+        }
+        break;
+    case BUDDY_EVENT_BLE_CONNECTED:
+        if (state->ble_connection_generation != event->ble.connection_generation) {
+            buddy_invalidate_prompt(state);
+            state->passkey_visible = false;
+            state->connected = false;
+            state->heartbeat_stale = true;
+            if (state->confirmation_acknowledge) {
+                buddy_close_confirmation(state);
+            }
+        }
+        state->ble_connection_generation = event->ble.connection_generation;
+        state->ble_connected = true;
+        state->ble_encrypted = false;
+        if (state->confirmation == BUDDY_CONFIRM_NONE) {
+            state->connection = BUDDY_CONNECTION_PAIRING;
+        }
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_BLE_DISCONNECTED:
+        state->ble_connection_generation = event->ble.connection_generation;
+        state->ble_connected = false;
+        state->ble_encrypted = false;
+        state->passkey_visible = false;
+        state->connected = false;
+        state->heartbeat_stale = true;
+        state->dsh.available = false;
+        state->dsh.working = false;
+        state->dsh_baseline = false;
+        buddy_clear_logical_session(state);
+        if (state->confirmation_acknowledge) {
+            buddy_close_confirmation(state);
+        } else if (state->confirmation == BUDDY_CONFIRM_NONE) {
+            state->connection = BUDDY_CONNECTION_OFFLINE;
+        }
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_BLE_PASSKEY:
+        if (event->ble.connection_generation != state->ble_connection_generation) {
+            break;
+        }
+        state->passkey = event->ble.passkey;
+        state->passkey_visible = true;
+        state->connection = BUDDY_CONNECTION_PAIRING;
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_BLE_ENCRYPTION:
+        if (event->ble.connection_generation != state->ble_connection_generation) {
+            break;
+        }
+        state->ble_encrypted = event->ble.secure;
+        if (event->ble.secure) {
+            state->passkey_visible = false;
+            if (state->confirmation == BUDDY_CONFIRM_NONE) {
+                state->connection = state->connected && !state->heartbeat_stale
+                                        ? BUDDY_CONNECTION_CONNECTED
+                                        : BUDDY_CONNECTION_OFFLINE;
+            }
+        } else if (state->ble_connected && state->confirmation == BUDDY_CONFIRM_NONE) {
+            state->connection = BUDDY_CONNECTION_PAIRING;
+        }
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_BOND_DELETE_RESULT:
+        buddy_copy(state->message, sizeof(state->message),
+                   event->ble.success ? "已解除配对" : "解除配对失败");
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_PERMISSION_SEND_RESULT:
+        buddy_apply_permission_result(state, &event->permission_result, now_ms, action);
+        break;
+    case BUDDY_EVENT_KEY_CLICK:
+        if (state->screen_off || state->screen_dimmed) {
+            state->screen_off = false;
+            state->screen_dimmed = false;
+            if (action != NULL) {
+                action->type = BUDDY_ACTION_DISPLAY_BACKLIGHT;
+                action->brightness_percent =
+                    buddy_brightness_percent(state->brightness_level);
+            }
+            break;
+        }
+        if (state->confirmation != BUDDY_CONFIRM_NONE && event->key == BUDDY_KEY_OK) {
+            buddy_confirmation_t confirmation = state->confirmation;
+            bool acknowledge = state->confirmation_acknowledge;
+            uint32_t connection_generation = state->confirmation_connection_generation;
+
+            buddy_close_confirmation(state);
+            if (action != NULL) {
+                action->type = confirmation == BUDDY_CONFIRM_UNPAIR
+                                   ? BUDDY_ACTION_UNPAIR_CONFIRMED
+                                   : BUDDY_ACTION_FACTORY_RESET_CONFIRMED;
+                action->confirmation_acknowledge = acknowledge;
+                action->connection_generation = connection_generation;
+            }
+            break;
+        }
+        if (state->confirmation != BUDDY_CONFIRM_NONE && event->key == BUDDY_KEY_DOWN) {
+            buddy_close_confirmation(state);
+            buddy_set_ui_refresh(action);
+            break;
+        }
+        if (state->confirmation != BUDDY_CONFIRM_NONE) {
+            break;
+        }
+        if (buddy_has_actionable_prompt(state) && event->key == BUDDY_KEY_OK) {
+            buddy_decide_prompt(state, event, BUDDY_PERMISSION_ONCE, action);
+        } else if (buddy_has_actionable_prompt(state) && event->key == BUDDY_KEY_DOWN) {
+            buddy_decide_prompt(state, event, BUDDY_PERMISSION_DENY, action);
+        } else if (buddy_has_actionable_prompt(state) && event->key == BUDDY_KEY_UP) {
+            if (action != NULL) {
+                action->type = BUDDY_ACTION_UI_SCROLL;
+                action->scroll_delta = -48;
+            }
+        } else if (!buddy_has_prompt(state) && event->observed_prompt_id_length == 0U) {
+            /* An OK on the home view must have been observed without an approval. */
+            if (event->key != BUDDY_KEY_OK || state->page != BUDDY_PAGE_HOME ||
+                state->menu_open || event->has_observed_prompt_id) {
+                buddy_page_t before_page = state->page;
+                buddy_normal_click(state, event->key, action);
+                if ((before_page == BUDDY_PAGE_HOME || before_page == BUDDY_PAGE_DEEPSEEK) &&
+                    (state->page == BUDDY_PAGE_HOME || state->page == BUDDY_PAGE_DEEPSEEK) &&
+                    state->page != before_page) {
+                    state->auto_page_hold_until_ms = now_ms + BUDDY_AUTO_PAGE_HOLD_MS;
+                }
+            }
+        }
+        break;
+    case BUDDY_EVENT_KEY_LONG:
+        break;
+    case BUDDY_EVENT_LAN_DISCONNECTED:
+        state->lan_connected = false;
+        state->connected = false;
+        state->heartbeat_stale = true;
+        state->dsh.available = false;
+        state->dsh.working = false;
+        state->dsh_baseline = false;
+        buddy_clear_logical_session(state);
+        state->connection = BUDDY_CONNECTION_OFFLINE;
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_TICK:
+        if (state->dsh_notice && now_ms >= state->dsh_notice_until_ms) {
+            state->dsh_notice = false;
+        }
+        buddy_update_auto_page(state, now_ms, action);
+        buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_NONE:
+        break;
+    }
+
+    bool attention = buddy_has_actionable_prompt(state) || state->passkey_visible || state->lan_pair_id ||
+                     state->confirmation != BUDDY_CONFIRM_NONE || state->dsh_notice;
+    bool working = state->connected && !state->heartbeat_stale &&
+                   (state->running > 0U || state->waiting > 0U);
+    static const uint64_t delays[BUDDY_SLEEP_COUNT] = {
+        [BUDDY_SLEEP_1_MIN] = 60000ULL,
+        [BUDDY_SLEEP_5_MIN] = 300000ULL,
+        [BUDDY_SLEEP_10_MIN] = 600000ULL,
+        [BUDDY_SLEEP_NEVER] = 0ULL,
+        [BUDDY_SLEEP_10_SEC] = 10000ULL,
+        [BUDDY_SLEEP_30_SEC] = 30000ULL,
+    };
+    uint8_t mode = state->settings.sleep_mode < BUDDY_SLEEP_COUNT
+                       ? state->settings.sleep_mode : BUDDY_DEFAULT_SLEEP_MODE;
+    uint64_t delay = delays[mode];
+    bool expired = delay != 0U && now_ms >= state->last_activity_ms &&
+                   now_ms - state->last_activity_ms >= delay;
+    if (attention || state->lan_setup) {
+        state->screen_off = false;
+        state->screen_dimmed = false;
+        state->last_activity_ms = now_ms;
+    } else if (working) {
+        state->screen_dimmed = expired;
+    } else {
+        state->screen_dimmed = false;
+        if (expired) state->screen_off = true;
+    }
+    buddy_refresh_character(state, now_ms);
+}
+
+void buddy_state_snapshot(const buddy_state_t *state, buddy_ui_snapshot_t *snapshot)
+{
+    if (state == NULL || snapshot == NULL) {
+        return;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->connection = state->connection;
+    snapshot->character = state->character;
+    snapshot->sound_mode = state->settings.sound_mode;
+    snapshot->volume_level = state->settings.volume_level;
+    snapshot->tone = state->settings.tone;
+    snapshot->sleep_mode = state->settings.sleep_mode;
+    snapshot->page = state->page;
+    snapshot->running = state->running;
+    snapshot->total = state->total;
+    snapshot->waiting = state->waiting;
+    snapshot->tokens = state->tokens;
+    snapshot->tokens_today = state->tokens_today;
+    snapshot->codex_usage = state->codex_usage;
+    snapshot->deepseek = state->deepseek;
+    snapshot->dsh = state->dsh;
+    snapshot->dsh_notice = state->dsh_notice;
+    snapshot->epoch_seconds = state->epoch_seconds;
+    snapshot->timezone_offset_seconds = state->timezone_offset_seconds;
+    snapshot->time_received_ms = state->time_received_ms;
+    snapshot->heartbeat_stale = state->heartbeat_stale;
+    snapshot->confirmation_pending = state->confirmation_pending;
+    snapshot->confirmation = state->confirmation;
+    snapshot->settings_selection = state->settings_selection;
+    snapshot->reset_selection = state->reset_selection;
+    snapshot->menu_selection = state->menu_selection;
+    snapshot->pet_page = state->pet_page;
+    snapshot->info_page = state->info_page;
+    snapshot->menu_open = state->menu_open;
+    snapshot->reset_open = state->reset_open;
+    snapshot->brightness_level = state->brightness_level;
+    snapshot->screen_off = state->screen_off;
+    snapshot->species = state->species;
+    snapshot->approval_locked = state->approval_locked;
+    snapshot->permission_delivery = state->permission_delivery;
+    snapshot->ble_connected = state->ble_connected;
+    snapshot->lan_mode = state->lan_mode;
+    snapshot->lan_pair_id = state->lan_pair_id;
+    snapshot->lan_pair_code = state->lan_pair_code;
+    snapshot->lan_pair_approved = state->lan_pair_approved;
+    snapshot->lan_setup = state->lan_setup;
+    snapshot->lan_connected = state->lan_connected;
+    memcpy(snapshot->lan_ip, state->lan_ip, sizeof(snapshot->lan_ip));
+    snapshot->ble_encrypted = state->ble_encrypted;
+    snapshot->ble_enabled = state->settings.ble_enabled;
+    snapshot->battery_available = state->battery_available;
+    snapshot->passkey_visible = state->passkey_visible;
+    snapshot->prompt_connection_generation = state->prompt_connection_generation;
+    snapshot->confirmation_connection_generation =
+        state->confirmation_connection_generation;
+    snapshot->passkey = state->passkey;
+    snapshot->battery_percent = state->battery_percent;
+    snapshot->battery_mv = state->battery_mv;
+    buddy_copy(snapshot->name, sizeof(snapshot->name), state->name);
+    buddy_copy(snapshot->owner, sizeof(snapshot->owner), state->owner);
+    buddy_copy(snapshot->time, sizeof(snapshot->time), state->time);
+    buddy_copy(snapshot->message, sizeof(snapshot->message), state->message);
+    buddy_copy_entries(snapshot->entries, state->entries);
+    buddy_copy(snapshot->prompt_id, sizeof(snapshot->prompt_id), state->prompt.id);
+    buddy_copy(snapshot->prompt_tool, sizeof(snapshot->prompt_tool), state->prompt.tool);
+    buddy_copy(snapshot->prompt_hint, sizeof(snapshot->prompt_hint), state->prompt.hint);
+}

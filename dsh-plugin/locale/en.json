@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Passport DSH activity",
+    "description": "Publishes DSH agent working and turn-completion state to a local file for the AI Passport companion.",
+    "detail": "docs/DETAIL.md"
+  }
+}

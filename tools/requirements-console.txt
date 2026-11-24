@@ -1,0 +1,5 @@
+bleak>=1.1
+cryptography>=43
+psutil>=5.9
+certifi>=2024.2
+zstandard>=0.23
