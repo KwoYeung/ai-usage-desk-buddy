@@ -14,18 +14,19 @@ class BleTransport:
     def is_connected(self):
         return bool(self.client.is_connected)
 
-    async def write(self, payload):
+    async def write(self, payload, *, response=True):
         characteristic = self.client.services.get_characteristic(RX)
         if characteristic is None:
             raise ValueError('未找到设备蓝牙接收通道')
         size = max(20, min(244, characteristic.max_write_without_response_size))
         wire = payload.rstrip(b'\r\n') + b'\n'
         for offset in range(0, len(wire), size):
-            await self.client.write_gatt_char(RX, wire[offset:offset+size], response=False)
+            await self.client.write_gatt_char(RX, wire[offset:offset+size], response=response)
 
     async def send_payload(self, payload):
         async with self.lock:
-            await asyncio.wait_for(self.write(payload), timeout=5)
+            # Acknowledged writes let the bridge detect a stalled link before it disconnects.
+            await asyncio.wait_for(self.write(payload, response=True), timeout=5)
 
     async def close(self):
         with suppress(Exception):
