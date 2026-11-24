@@ -2,7 +2,10 @@
 
 **简体中文** · [English](README.md)
 
-![AI 用量桌伴](assets/cover.png)
+<p align="center">
+  <img src="assets/cover-codex.png" width="47%" alt="Codex 页面示意">
+  <img src="assets/cover.png" width="47%" alt="DeepSeek 页面示意">
+</p>
 
 *界面示意，所有数值均为占位符。*
 

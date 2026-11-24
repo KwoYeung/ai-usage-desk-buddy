@@ -2,9 +2,12 @@
 
 [简体中文](README.zh_CN.md) · **English**
 
-![AI Usage Desk Buddy](assets/cover.png)
+<p align="center">
+  <img src="assets/cover-codex.png" width="47%" alt="Codex page illustration">
+  <img src="assets/cover.png" width="47%" alt="DeepSeek page illustration">
+</p>
 
-*Interface illustration; all values are placeholders.*
+*Interface illustrations; all values are placeholders.*
 
 Author: **KwoYeung**
 
