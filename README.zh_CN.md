@@ -32,9 +32,10 @@
 ## 快速开始
 
 1. 编译并刷入 `main` 固件（见下方）。
-2. 启动电脑控制台：
-   - Windows：双击 `start-console.vbs`；也可以运行 `start-console.cmd` 查看错误。
-   - macOS：运行 `bash start-console.command`。
+2. 准备电脑后台：
+   - Windows：先安装 Python 3.10+ 和 WebView2；从本仓库下载**完整源码 ZIP**（GitHub 的 Code → Download ZIP），解压到固定目录。只下载 `start-console.vbs` 不能运行，它需要同目录的 `tools/`。
+   - 双击解压目录里的 `start-console.vbs`；首次启动会自动创建环境并安装依赖。也可以运行 `start-console.cmd` 查看错误。
+   - macOS：在完整源码目录运行 `bash start-console.command`。
 3. 控制台选择蓝牙，搜索并连接设备；按系统提示输入设备上的六位配对码。设备左上角显示「已连接BLE」即成功。
 4. 在控制台「状态 → DeepSeek」填入自己的 DeepSeek API Key，保存并验证，即可显示余额。
 5. 如需 DSH 工作中／完成提醒，将 `dsh-plugin/` 安装到 DSH（Plugins → Add plugin）；不安装时 Codex 功能不受影响。

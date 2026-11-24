@@ -32,9 +32,10 @@ An AI Passport desk companion for Codex and DSH. It shows usage, DeepSeek balanc
 ## Quick start
 
 1. Build and flash the `main` firmware (below).
-2. Start the console:
-   - Windows: double-click `start-console.vbs` (use `start-console.cmd` for error output).
-   - macOS: run `bash start-console.command`.
+2. Prepare the desktop backend:
+   - Windows: install Python 3.10+ and WebView2. Download the **complete source ZIP** from this repository (Code → Download ZIP) and extract it to a fixed folder. Downloading only `start-console.vbs` is not enough; it needs the adjacent `tools/`.
+   - Double-click `start-console.vbs` in the extracted folder; the first launch creates the environment and installs dependencies. Use `start-console.cmd` for error output.
+   - macOS: run `bash start-console.command` in the complete source folder.
 3. Choose Bluetooth in the console, search for the device, and enter the six-digit pairing code shown on the device when prompted. The device is connected when its top-left shows “已连接BLE”.
 4. Open **Status → DeepSeek** in the console, save and verify your DeepSeek API key to show the balance.
 5. For DSH working/completion alerts, install `dsh-plugin/` in DSH (Plugins → Add plugin). Codex features work without it.
