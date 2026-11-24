@@ -7,4 +7,4 @@ fi
 if ! .venv-console/bin/python -c 'import bleak, cryptography, psutil' 2>/dev/null; then
   .venv-console/bin/python -m pip install -r tools/requirements-console.txt
 fi
-exec .venv-console/bin/python tools/passport_console.py
+exec .venv-console/bin/python tools/passport_console.py --config-dir "$PWD/.local-console"
