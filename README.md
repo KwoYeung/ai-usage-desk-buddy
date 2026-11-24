@@ -1,5 +1,11 @@
 # AI Usage Desk Buddy
 
+[简体中文](README.zh_CN.md) · **English**
+
+![AI Usage Desk Buddy](assets/cover.png)
+
+*Interface illustration; all values are placeholders.*
+
 Author: **KwoYeung**
 
 An AI Passport desk companion for Codex and DSH. It shows usage, DeepSeek balance, and which assistant is working, and plays a quiet alert when a task finishes. The screen follows the active assistant and rotates when both are busy.

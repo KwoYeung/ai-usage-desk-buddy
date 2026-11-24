@@ -1,5 +1,11 @@
 # AI 用量桌伴 · AI Usage Desk Buddy
 
+**简体中文** · [English](README.md)
+
+![AI 用量桌伴](assets/cover.png)
+
+*界面示意，所有数值均为占位符。*
+
 作者：**KwoYeung**
 
 把 AI Passport 变成桌面上的 AI 工作搭档：集中查看 Codex 与 DSH 的用量、DeepSeek 余额和当前工作状态，并在任务完成时收到轻提醒。设备会根据谁在工作自动切换页面；两边同时工作时轮播。
