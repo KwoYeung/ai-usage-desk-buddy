@@ -46,8 +46,10 @@ class CodexAppServer:
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self.next_id = 1
         self.reader_task: asyncio.Task[None] | None = None
+        self.alive = False
 
     async def start(self) -> None:
+        self.alive = False
         self.process = await asyncio.create_subprocess_exec(
             self.executable,
             "app-server",
@@ -71,8 +73,28 @@ class CodexAppServer:
             },
         )
         await self.notify("initialized")
+        self.alive = True
+
+    def is_running(self) -> bool:
+        return bool(
+            self.alive
+            and self.process is not None
+            and self.process.returncode is None
+        )
+
+    async def ensure_started(self) -> bool:
+        if self.is_running():
+            return False
+        await self.restart()
+        return True
+
+    async def restart(self) -> None:
+        await self.close()
+        self.next_id = 1
+        await self.start()
 
     async def close(self) -> None:
+        self.alive = False
         try:
             if self.process is not None:
                 if self.process.stdin is not None:
@@ -170,6 +192,7 @@ class CodexAppServer:
             future = self.pending.get(request_id)
             if future is not None and not future.done():
                 future.set_result(message)
+        self.alive = False
         for future in self.pending.values():
             if not future.done():
                 future.set_exception(RuntimeError("Codex app-server stopped"))
@@ -777,6 +800,8 @@ async def bridge_loop(args: argparse.Namespace, control=None) -> None:
                             changed = True
                         if now - last_usage >= USAGE_REFRESH_SECONDS:
                             try:
+                                if await app_server.ensure_started():
+                                    print("Codex app-server reconnected.", file=sys.stderr, flush=True)
                                 refreshed_usage = await app_server.rate_limits()
                                 if refreshed_usage.get("available"):
                                     usage = refreshed_usage
@@ -793,6 +818,8 @@ async def bridge_loop(args: argparse.Namespace, control=None) -> None:
                             changed = True
                         if now - last_task_refresh >= TASK_REFRESH_SECONDS:
                             try:
+                                if await app_server.ensure_started():
+                                    print("Codex app-server reconnected.", file=sys.stderr, flush=True)
                                 server_running_count = await app_server.running_task_count()
                                 refreshed_count = max(
                                     server_running_count, watcher.running_count
